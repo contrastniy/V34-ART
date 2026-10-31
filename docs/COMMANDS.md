@@ -13,6 +13,12 @@ art_stats
 art_record path <folder|default>
 art_open_folder
 art_prefix <prefix|default>
+art_output_mode <tga|ffmpeg>
+art_ffmpeg_path <path|default>
+art_ffmpeg_preset <prores_422|prores_4444|h264_hq|h264_lossless|nvenc_h264|nvenc_hevc|custom>
+art_ffmpeg_custom <arguments_template>
+art_ffmpeg_test
+art_ffmpeg_status
 art_take_json <on|off|status|write>
 art_debug <on|off>
 ```
@@ -38,10 +44,12 @@ art_players_color <r> <g> <b>
 art_players_through_walls <on|off>
 art_players_world_weapons <on|off>
 art_objectid_color <viewmodel|players|world|skybox> <r> <g> <b>
+art_depth_mode <fog|d3d9|precise>  // default fog; d3d9/precise captures hardware Z-buffer via INTZ
 art_depth_start <distance>    // default 150
 art_depth_end <distance>      // default 800
 ```
 
+`art_depth_mode` toggles between Source Engine classic white fog depth ramp (`fog`) and hardware Direct3D 9 Z-buffer capture (`d3d9` / `precise` using INTZ FourCC substitution). In-game GUI menu (`Shift+F3`) includes a direct dropdown switcher on the Passes page with hardware capability indicator.
 ObjectID defaults: viewmodel `255 128 0`, players `0 0 255`, world `255 255 0`, skybox `255 0 0`.
 
 ## FOV and visuals
@@ -92,6 +100,7 @@ art_gui_experimental <on|off>
 art_overlay <on|off>
 art_config save|load|delete|list [name]
 art_demo_pause_after_recording <on|off>
+art_demo_unpause_on_recording <on|off>
 ```
 
 Default GUI shortcut: `Shift+F3`. Configs are stored in `cstrike/cfg/art_gui`.

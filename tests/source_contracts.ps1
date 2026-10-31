@@ -278,6 +278,10 @@ Require-Text $gui 'ImGui::Checkbox( "Force r_lod", &forceRenderLod )' "Forced r_
 Require-Text $gui 'ImGui::InputInt( "r_lod value", &forcedRenderLod )' "Forced r_lod GUI value field is missing."
 Require-Text $gui '"art_force_r_lod value -7\r\n"' "Generated default config is missing the r_lod value."
 Require-Text $gui '"art_force_r_lod off\r\n"' "Generated default config must keep r_lod forcing off."
+Require-Text $gui '"art_output_mode tga\r\n"' "Generated default config is missing output mode."
+Require-Text $gui '"art_ffmpeg_preset prores_422\r\n"' "Generated default config is missing FFmpeg preset."
+Require-Text $gui 'art_output_mode %s\r\n' "GUI config save does not serialize the output capture mode."
+Require-Text $gui 'art_ffmpeg_preset %s\r\n' "GUI config save does not serialize the FFmpeg preset."
 Require-Text $runtime 'RECORD_OBJECTID' "ObjectID record bit is missing."
 Require-Text $runtime 'case PREVIEW_OBJECTID: return "objectid";' "ObjectID preview name is missing."
 Require-Text $gui 'ObjectID colors' "ObjectID GUI color controls are missing."
@@ -398,7 +402,7 @@ Require-NotText $gui 'ImGui::TextDisabled(' "Muted GUI text bypasses the auto-wr
 Require-Text $gui 'TextDisabledWrapped( "Global FOV overrides both the camera and viewmodel FOV.' "Global FOV definition must use muted wrapped text."
 Require-Text $gui 'ImGui::SetNextWindowSize( ImVec2( 1220, 760 )' "The main GUI does not use the requested wider default size."
 Require-Text $gui 'art_demo_pause_after_recording off' "Automatic demo pause must default to off."
-Require-Text $gui 'Pause demo after recording stops (experimental)' "Experimental automatic demo-pause GUI option is missing."
+Require-Text $gui 'Pause demo after recording stops' "Automatic demo-pause GUI option is missing."
 Require-Text $gui 'ConCommand g_ArtDemoPauseAfterRecordingCommand' "Automatic demo-pause command is missing."
 Require-Text $commands 'PauseArtDemoAfterRecordingIfEnabled();' "Recording stop does not request the configured demo pause."
 
@@ -409,6 +413,7 @@ if ($capturePageStart -lt 0 -or $passesPageBoundary -le $capturePageStart) {
 }
 else {
 	$capturePage = $gui.Substring($capturePageStart, $passesPageBoundary - $capturePageStart)
+	Require-Text $capturePage 'Pause demo after recording stops' "Demo pause after recording option is missing from Capture page."
 	if ($capturePage.IndexOf('"##host_framerate"', [StringComparison]::Ordinal) -gt
 		$capturePage.IndexOf('"capture_demo"', [StringComparison]::Ordinal)) {
 		$failures.Add("host_framerate must appear in the recording section before Demo playback.")

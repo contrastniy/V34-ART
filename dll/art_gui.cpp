@@ -5,6 +5,8 @@
 #include "art_internal.h"
 #include "art_gui.h"
 #include "art_hlae.h"
+#include "art_ffmpeg.h"
+#include "art_d3d9_depth.h"
 
 #define DIRECTINPUT_VERSION 0x0800
 #include <d3d9.h>
@@ -87,6 +89,8 @@ namespace
 	static const int kD3D9PresentIndex = 17;
 	static const int kD3D9EndSceneIndex = 42;
 	static const int kD3D9SwapChainPresentIndex = 3;
+	static const int kD3D9CreateDepthStencilSurfaceIndex = 29;
+	static const int kD3D9SetDepthStencilSurfaceIndex = 39;
 	static const int kMaxCommandHistory = 18;
 	static const int kDemoPlayerRefreshMinimumAttempts = 6;
 	static const int kDemoPlayerRefreshMaximumAttempts = 60;
@@ -105,6 +109,8 @@ namespace
 	typedef HRESULT ( WINAPI *EndSceneFn )( IDirect3DDevice9 * );
 	typedef HRESULT ( WINAPI *SwapChainPresentFn )( IDirect3DSwapChain9 *, const RECT *, const RECT *, HWND,
 		const RGNDATA *, DWORD );
+	typedef HRESULT ( WINAPI *CreateDepthStencilSurfaceFn )( IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9 **, HANDLE * );
+	typedef HRESULT ( WINAPI *SetDepthStencilSurfaceFn )( IDirect3DDevice9 *, IDirect3DSurface9 * );
 	typedef BOOL ( WINAPI *GetCursorPosFn )( POINT * );
 	typedef BOOL ( WINAPI *SetCursorPosFn )( int, int );
 	typedef BOOL ( WINAPI *ClipCursorFn )( const RECT * );
@@ -159,6 +165,7 @@ namespace
 		bool waitingForHlaeInputHoldKey;
 		bool experimentalOptionsEnabled;
 		bool autoPauseDemoAfterRecording;
+		bool autoResumeDemoOnRecordingStart;
 		bool showCaptureHelp;
 		bool showHlaeCampathHelp;
 		bool showHlaeInputHelp;
@@ -216,6 +223,10 @@ namespace
 		char commandFilter[64];
 		char lastError[256];
 		char previousMouseEnable[32];
+		char ffmpegPath[MAX_PATH];
+		char ffmpegCustomArgs[1024];
+		ArtFfmpegTestResult ffmpegTestResult;
+		bool ffmpegTestPerformed;
 		std::vector<std::string> configs;
 		std::vector<TakeEntry> takes;
 		std::vector<std::string> demos;
@@ -227,7 +238,7 @@ namespace
 			  mouseStateStored( false ), refreshConfigs( true ), refreshTakes( true ),
 			  refreshDemos( true ), refreshDemoPlayers( true ),
 			  demoWasPlaying( false ), spectatorUiHidden( false ),
-			  configSelectionChanged( false ),
+			  configSelectionChanged( false ), ffmpegTestPerformed( false ),
 			  selectedPage( 0 ), selectedConfig( -1 ), selectedTake( -1 ),
 			  selectedDemo( -1 ), selectedDemoPlayer( -1 ),
 			  spectatorMode( 3 ), demoPlayerRefreshAttempts( 0 ),
@@ -237,6 +248,7 @@ namespace
 			  toggleKey( VK_F3 ), toggleModifiers( TOGGLE_MODIFIER_SHIFT ), waitingForToggleKey( false ),
 			  hlaeInputHoldKey( VK_LBUTTON ), waitingForHlaeInputHoldKey( false ),
 			  experimentalOptionsEnabled( false ), autoPauseDemoAfterRecording( false ),
+			  autoResumeDemoOnRecordingStart( false ),
 			  showCaptureHelp( false ), showHlaeCampathHelp( false ),
 			  showHlaeInputHelp( false ), resetInfoScroll( false ),
 			  globalFov( 90.0f ), globalFovDefault( true )
@@ -302,6 +314,8 @@ namespace
 	void *g_pPresentTarget = NULL;
 	void *g_pEndSceneTarget = NULL;
 	void *g_pSwapChainPresentTarget = NULL;
+	void *g_pCreateDepthStencilSurfaceTarget = NULL;
+	void *g_pSetDepthStencilSurfaceTarget = NULL;
 	void *g_pGetCursorPosTarget = NULL;
 	void *g_pSetCursorPosTarget = NULL;
 	void *g_pClipCursorTarget = NULL;
@@ -310,6 +324,8 @@ namespace
 	PresentFn g_pOriginalPresent = NULL;
 	EndSceneFn g_pOriginalEndScene = NULL;
 	SwapChainPresentFn g_pOriginalSwapChainPresent = NULL;
+	CreateDepthStencilSurfaceFn g_pOriginalCreateDepthStencilSurface = NULL;
+	SetDepthStencilSurfaceFn g_pOriginalSetDepthStencilSurface = NULL;
 	GetCursorPosFn g_pOriginalGetCursorPos = NULL;
 	SetCursorPosFn g_pOriginalSetCursorPos = NULL;
 	ClipCursorFn g_pOriginalClipCursor = NULL;
@@ -319,6 +335,8 @@ namespace
 	bool g_bPresentHookCreated = false;
 	bool g_bEndSceneHookCreated = false;
 	bool g_bSwapChainPresentHookCreated = false;
+	bool g_bCreateDepthStencilSurfaceHookCreated = false;
+	bool g_bSetDepthStencilSurfaceHookCreated = false;
 	bool g_bGetCursorPosHookCreated = false;
 	bool g_bSetCursorPosHookCreated = false;
 	bool g_bClipCursorHookCreated = false;
@@ -1629,6 +1647,7 @@ namespace
 			"art_gui_key SHIFT+F3\r\n"
 			"art_gui_experimental off\r\n"
 			"art_demo_pause_after_recording off\r\n"
+			"art_demo_unpause_on_recording off\r\n"
 			"art_hlae enabled 1\r\n"
 			"art_hlae autoExport agr 0\r\n"
 			"art_hlae autoExport camio 0\r\n"
@@ -1660,6 +1679,9 @@ namespace
 			"art_queue max_mb 256\r\n"
 			"art_queue reserve_mb 256\r\n"
 			"art_tga_compression auto\r\n"
+			"art_output_mode tga\r\n"
+			"art_ffmpeg_preset prores_422\r\n"
+			"art_ffmpeg_path default\r\n"
 			"host_framerate 0\r\n"
 			"art_preview off\r\n"
 			"art_record normal on\r\n"
@@ -1703,6 +1725,7 @@ namespace
 			"art_chams skybox_color 120 150 220\r\n"
 			"art_depth_start 150\r\n"
 			"art_depth_end 800\r\n"
+			"art_depth_curve linear\r\n"
 			"art_record path default\r\n"
 			"art_prefix default\r\n"
 			"art_debug off\r\n";
@@ -1789,6 +1812,8 @@ namespace
 			g_Gui.experimentalOptionsEnabled ? "on" : "off" );
 		AppendFormat( cfg, "art_demo_pause_after_recording %s\r\n",
 			g_Gui.autoPauseDemoAfterRecording ? "on" : "off" );
+		AppendFormat( cfg, "art_demo_unpause_on_recording %s\r\n",
+			g_Gui.autoResumeDemoOnRecordingStart ? "on" : "off" );
 		AppendFormat( cfg, "art_hlae_input_while_gui %s\r\n",
 			g_Gui.hlaeInputWhileGui ? "on" : "off" );
 		char hlaeInputHoldKey[32];
@@ -1816,6 +1841,30 @@ namespace
 		AppendFormat( cfg, "art_tga_compression %s\r\n",
 			ArtTgaCompressionModeName( InterlockedCompareExchange(
 				&g_nArtTgaCompressionMode, 0, 0 ) ) );
+		AppendFormat( cfg, "art_output_mode %s\r\n",
+			GetArtOutputModeName( InterlockedCompareExchange(
+				&g_nArtOutputMode, 0, 0 ) ) );
+		const LONG currentFfmpegPreset = InterlockedCompareExchange( &g_nArtFfmpegPreset, 0, 0 );
+		if ( currentFfmpegPreset == ART_FFMPEG_PRESET_CUSTOM && g_szArtFfmpegCustomArgs[0] )
+		{
+			bool safeArgs = true;
+			for ( const char *p = g_szArtFfmpegCustomArgs; *p; ++p )
+			{
+				if ( *p == ';' || *p == '\r' || *p == '\n' )
+				{
+					safeArgs = false;
+					break;
+				}
+			}
+			if ( safeArgs )
+				AppendFormat( cfg, "art_ffmpeg_custom %s\r\n", g_szArtFfmpegCustomArgs );
+		}
+		AppendFormat( cfg, "art_ffmpeg_preset %s\r\n",
+			GetArtFfmpegPresetName( currentFfmpegPreset ) );
+		if ( !g_szArtFfmpegPath[0] || !Q_stricmp( g_szArtFfmpegPath, "default" ) || !Q_stricmp( g_szArtFfmpegPath, "ffmpeg.exe" ) )
+			AppendFormat( cfg, "art_ffmpeg_path default\r\n" );
+		else if ( IsSafeQuotedArgument( g_szArtFfmpegPath ) )
+			AppendFormat( cfg, "art_ffmpeg_path \"%s\"\r\n", g_szArtFfmpegPath );
 		AppendFormat( cfg, "art_gui_color accent %d %d %d %d\r\n",
 			ColorToByte( g_Gui.accentColor[0] ), ColorToByte( g_Gui.accentColor[1] ),
 			ColorToByte( g_Gui.accentColor[2] ), ColorToByte( g_Gui.accentColor[3] ) );
@@ -1952,6 +2001,8 @@ namespace
 			InterlockedCompareExchange( &g_nSkyboxChamsRed, 0, 0 ),
 			InterlockedCompareExchange( &g_nSkyboxChamsGreen, 0, 0 ),
 			InterlockedCompareExchange( &g_nSkyboxChamsBlue, 0, 0 ) );
+		AppendFormat( cfg, "art_depth_mode %s\r\n", GetArtDepthModeName( InterlockedCompareExchange( &g_nArtDepthMode, 0, 0 ) ) );
+		AppendFormat( cfg, "art_depth_curve %s\r\n", GetArtDepthCurveName( InterlockedCompareExchange( &g_nArtDepthCurve, 0, 0 ) ) );
 		AppendFormat( cfg, "art_depth_start %g\r\n", art_depth_start.GetFloat() );
 		AppendFormat( cfg, "art_depth_end %g\r\n", art_depth_end.GetFloat() );
 
@@ -2540,7 +2591,10 @@ namespace
 		if ( IsArtGuiVisible() && keyMessage && key == VK_ESCAPE )
 		{
 			if ( keyReleased )
+			{
+				SetHlaeInputWhileGuiActive( false );
 				SetArtGuiVisible( false );
+			}
 			return 0;
 		}
 
@@ -2685,6 +2739,8 @@ namespace
 	{
 		Q_strncpy( g_Gui.outputPath, g_szRecordBase, sizeof( g_Gui.outputPath ) );
 		Q_strncpy( g_Gui.prefix, g_szCapturePrefix, sizeof( g_Gui.prefix ) );
+		Q_strncpy( g_Gui.ffmpegPath, g_szArtFfmpegPath, sizeof( g_Gui.ffmpegPath ) );
+		Q_strncpy( g_Gui.ffmpegCustomArgs, g_szArtFfmpegCustomArgs, sizeof( g_Gui.ffmpegCustomArgs ) );
 		ConVar *pHost = g_pCvar ? g_pCvar->FindVar( "host_framerate" ) : NULL;
 		g_Gui.hostFramerate = pHost ? pHost->GetInt() : 0;
 	}
@@ -2708,6 +2764,22 @@ namespace
 			IssueCommand( "art_prefix %s", g_Gui.prefix );
 		else
 			SetError( "prefix may contain only letters, numbers, '_' and '-'" );
+	}
+
+	void ApplyFfmpegPathField()
+	{
+		if ( !g_Gui.ffmpegPath[0] || !Q_stricmp( g_Gui.ffmpegPath, "default" ) )
+			IssueCommand( "art_ffmpeg_path default" );
+		else if ( IsSafeQuotedArgument( g_Gui.ffmpegPath ) )
+			IssueCommand( "art_ffmpeg_path \"%s\"", g_Gui.ffmpegPath );
+		else
+			SetError( "FFmpeg path cannot contain quotes or semicolons" );
+	}
+
+	void ApplyFfmpegCustomArgsField()
+	{
+		if ( g_Gui.ffmpegCustomArgs[0] )
+			IssueCommand( "art_ffmpeg_custom %s", g_Gui.ffmpegCustomArgs );
 	}
 
 	HWND ResolveGameWindow( HWND hFocusWindow )
@@ -3361,38 +3433,77 @@ namespace
 		g_Gui.demoClockTime = g_pEngine ? g_pEngine->Time() : 0.0f;
 	}
 
+	static int s_nPendingBackwardSeekTick = -1;
+	static DWORD s_dwPendingBackwardSeekTimeout = 0;
+	static DWORD s_dwBackwardSeekStartTime = 0;
+	static bool s_bRewindingToZero = false;
+
 	void UpdateDemoTickTracking()
 	{
-		if ( !g_pEngine || !g_pEngine->IsPlayingDemo() )
+		const bool playingDemo = g_pEngine && g_pEngine->IsPlayingDemo();
+		const bool pausedDemo = playingDemo && g_pEngine->IsPaused();
+
+		if ( !playingDemo )
 		{
 			g_Gui.currentDemoTickValid = false;
 			g_Gui.demoClockTime = g_pEngine ? g_pEngine->Time() : 0.0f;
+			g_Gui.demoWasPlaying = false;
 			return;
 		}
 
 		const float now = g_pEngine->Time();
-		if ( !g_Gui.currentDemoTickValid )
+		const DWORD nowMs = GetTickCount();
+		const bool demoJustStarted = !g_Gui.demoWasPlaying;
+		g_Gui.demoWasPlaying = true;
+
+		if ( demoJustStarted || !g_Gui.currentDemoTickValid )
 		{
-			ResetDemoTickTracking( g_Gui.demoTick, true );
-			return;
+			ScheduleDemoPlayerAutoRefresh( true );
+			MaintainHiddenSpectatorPanels();
+			g_Gui.demoClockTime = now;
+			g_Gui.demoTickFraction = 0.0f;
+			ResetDemoTickTracking( 0, true );
 		}
-		if ( g_pEngine->IsPaused() )
+
+		if ( s_bRewindingToZero )
 		{
+			if ( nowMs > s_dwPendingBackwardSeekTimeout )
+			{
+				s_bRewindingToZero = false;
+				s_nPendingBackwardSeekTick = -1;
+			}
+			else if ( ( nowMs - s_dwBackwardSeekStartTime >= 100 ) && pausedDemo )
+			{
+				s_bRewindingToZero = false;
+				const int target = s_nPendingBackwardSeekTick;
+				s_nPendingBackwardSeekTick = -1;
+				if ( target > 0 )
+				{
+					IssueCommand( "demo_gototick %d 0 1", target );
+				}
+				ResetDemoTickTracking( target, true );
+				g_Gui.demoClockTime = now;
+				return;
+			}
 			g_Gui.demoClockTime = now;
 			return;
 		}
 
-		const float delta = now - g_Gui.demoClockTime;
-		g_Gui.demoClockTime = now;
-		if ( delta < 0.0f || delta > 5.0f )
-			return;
-		g_Gui.demoTickFraction += delta * g_Gui.demoTickRate;
-		const int advancedTicks = static_cast<int>( g_Gui.demoTickFraction );
-		if ( advancedTicks > 0 )
+		if ( !pausedDemo )
 		{
-			g_Gui.currentDemoTick += advancedTicks;
-			g_Gui.demoTickFraction -= advancedTicks;
+			const float delta = now - g_Gui.demoClockTime;
+			if ( delta >= 0.0f && delta <= 0.25f )
+			{
+				g_Gui.demoTickFraction += delta * g_Gui.demoTickRate;
+				const int advancedTicks = static_cast<int>( g_Gui.demoTickFraction );
+				if ( advancedTicks > 0 )
+				{
+					g_Gui.currentDemoTick += advancedTicks;
+					g_Gui.demoTickFraction -= advancedTicks;
+				}
+			}
 		}
+		g_Gui.demoClockTime = now;
 	}
 
 	void LoadDemoFromField()
@@ -3407,6 +3518,8 @@ namespace
 			SetError( "demo name cannot contain quotes, semicolons, or line breaks" );
 			return;
 		}
+		s_bRewindingToZero = false;
+		s_nPendingBackwardSeekTick = -1;
 		LoadDemoTimingMetadata( g_Gui.demoName );
 		ScheduleDemoPlayerAutoRefresh( true );
 		g_Gui.demoTick = 0;
@@ -3418,9 +3531,26 @@ namespace
 	{
 		if ( tick < 0 ) tick = 0;
 		g_Gui.demoTick = tick;
-		ResetDemoTickTracking( tick, true );
-		// Source's third demo_gototick argument pauses playback once the target is reached.
-		IssueCommand( "demo_gototick %d 0 1", g_Gui.demoTick );
+
+		const bool isPlaying = g_pEngine && g_pEngine->IsPlayingDemo();
+		const int curTick = g_Gui.currentDemoTickValid ? g_Gui.currentDemoTick : 0;
+
+		if ( isPlaying && g_Gui.currentDemoTickValid && tick < curTick )
+		{
+			s_nPendingBackwardSeekTick = tick;
+			s_bRewindingToZero = true;
+			s_dwBackwardSeekStartTime = GetTickCount();
+			s_dwPendingBackwardSeekTimeout = s_dwBackwardSeekStartTime + 15000;
+			ResetDemoTickTracking( tick, true );
+			IssueCommand( "demo_gototick 0 0 1" );
+		}
+		else
+		{
+			s_bRewindingToZero = false;
+			s_nPendingBackwardSeekTick = -1;
+			ResetDemoTickTracking( tick, true );
+			IssueCommand( "demo_gototick %d 0 1", g_Gui.demoTick );
+		}
 	}
 
 	void ToggleDemoPlayback( bool paused )
@@ -3446,9 +3576,7 @@ namespace
 		long long target = base + delta;
 		if ( target < 0 ) target = 0;
 		if ( target > 2147483647LL ) target = 2147483647LL;
-		g_Gui.demoTick = static_cast<int>( target );
-		ResetDemoTickTracking( g_Gui.demoTick, true );
-		IssueCommand( "demo_gototick %d 0 1", g_Gui.demoTick );
+		SeekDemoTick( static_cast<int>( target ) );
 	}
 
 
@@ -3463,10 +3591,22 @@ namespace
 		ImGui::Separator();
 		ImGui::Spacing();
 
-		ImGui::BeginChild( "capture_card", ImVec2( 0, 176 ), ImGuiChildFlags_Borders );
+		ImGui::BeginChild( "capture_card", ImVec2( 0, 0 ),
+			ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY );
 		StatusBadge( recording, "RECORDING", "IDLE" );
 		ImGui::SameLine();
 		TextDisabledWrapped( "Frame %d", g_nFrame );
+		ImGui::SameLine();
+		const LONG currentOutputMode = InterlockedCompareExchange( &g_nArtOutputMode, 0, 0 );
+		if ( currentOutputMode == ART_OUTPUT_MODE_FFMPEG )
+		{
+			const LONG currentPreset = InterlockedCompareExchange( &g_nArtFfmpegPreset, 0, 0 );
+			ImGui::TextColored( ImVec4( 0.35f, 0.80f, 1.00f, 1.0f ), "[FFmpeg: %s]", GetArtFfmpegPresetName( currentPreset ) );
+		}
+		else
+		{
+			ImGui::TextColored( ImVec4( 0.70f, 0.70f, 0.70f, 1.0f ), "[TGA Frames]" );
+		}
 		TextDisabledWrapped( "The menu does not show on recorded footage." );
 		ImGui::Spacing();
 		ImGui::SetNextItemWidth( -1 );
@@ -3537,6 +3677,7 @@ namespace
 				InterlockedCompareExchange( &g_ArtValidationProgress.completedFiles, 0, 0 ),
 				InterlockedCompareExchange( &g_ArtValidationProgress.totalFiles, 0, 0 ) );
 		}
+
 		ImGui::EndChild();
 
 		ImGui::Spacing();
@@ -3549,12 +3690,6 @@ namespace
 
 		const bool playingDemo = g_pEngine && g_pEngine->IsPlayingDemo();
 		const bool pausedDemo = playingDemo && g_pEngine->IsPaused();
-		if ( playingDemo && !g_Gui.demoWasPlaying )
-		{
-			ScheduleDemoPlayerAutoRefresh( true );
-			MaintainHiddenSpectatorPanels();
-		}
-		g_Gui.demoWasPlaying = playingDemo;
 		UpdateDemoPlayerAutoRefresh();
 		ImGui::Text( "Current tick: %s", g_Gui.currentDemoTickValid ? "" : "not available" );
 		if ( g_Gui.currentDemoTickValid )
@@ -3627,6 +3762,18 @@ namespace
 		if ( ImGui::Button( "+100", ImVec2( 72, 0 ) ) ) JumpDemoTick( 100 );
 		ImGui::SameLine();
 		if ( ImGui::Button( "+1000", ImVec2( 72, 0 ) ) ) JumpDemoTick( 1000 );
+
+		ImGui::Spacing();
+		bool autoResume = g_Gui.autoResumeDemoOnRecordingStart;
+		if ( ImGui::Checkbox( "Unpause demo on recording start", &autoResume ) )
+		{
+			IssueCommand( "art_demo_unpause_on_recording %s", autoResume ? "on" : "off" );
+		}
+		bool autoPause = g_Gui.autoPauseDemoAfterRecording;
+		if ( ImGui::Checkbox( "Pause demo after recording stops", &autoPause ) )
+		{
+			IssueCommand( "art_demo_pause_after_recording %s", autoPause ? "on" : "off" );
+		}
 
 		ImGui::Separator();
 		TextUnformattedWrapped( "Spectator" );
@@ -3806,14 +3953,78 @@ namespace
 				static_cast<int>( playersBackgroundColor[1] * 255.0f + 0.5f ),
 				static_cast<int>( playersBackgroundColor[2] * 255.0f + 0.5f ) );
 		}
-		float depthStart = art_depth_start.GetFloat();
-		float depthEnd = art_depth_end.GetFloat();
+		LONG currentDepthMode = InterlockedCompareExchange( &g_nArtDepthMode, 0, 0 );
+		int depthModeIndex = ( currentDepthMode == ART_DEPTH_MODE_D3D9 ) ? 1 : 0;
+		static const char *depthModeNames[] = { "Fog (Source Engine classic)", "Hardware D3D9 (INTZ / Precise)" };
 		ImGui::SetNextItemWidth( 330 );
-		if ( ImGui::DragFloat( "Depth start", &depthStart, 5.0f, 0.0f, 100000.0f, "%.0f" ) )
-			IssueCommand( "art_depth_start %.3f", depthStart );
-		ImGui::SetNextItemWidth( 330 );
-		if ( ImGui::DragFloat( "Depth end", &depthEnd, 5.0f, 0.0f, 100000.0f, "%.0f" ) )
-			IssueCommand( "art_depth_end %.3f", depthEnd );
+		if ( ImGui::Combo( "Depth extraction mode", &depthModeIndex, depthModeNames, ARRAYSIZE( depthModeNames ) ) )
+		{
+			const LONG newMode = ( depthModeIndex == 1 ) ? ART_DEPTH_MODE_D3D9 : ART_DEPTH_MODE_FOG;
+			InterlockedExchange( &g_nArtDepthMode, newMode );
+			if ( newMode == ART_DEPTH_MODE_D3D9 )
+			{
+				EnsureActiveDepthSurfaceIsIntz( GetArtGuiDevice() );
+			}
+			IssueCommand( "art_depth_mode %s", ( newMode == ART_DEPTH_MODE_D3D9 ) ? "d3d9" : "fog" );
+		}
+
+		if ( depthModeIndex == 1 )
+		{
+			LONG currentCurve = InterlockedCompareExchange( &g_nArtDepthCurve, 0, 0 );
+			int curveIndex = ( currentCurve == ART_DEPTH_CURVE_LOGARITHMIC ) ? 1 : 0;
+			static const char *curveNames[] = { "Linear", "Logarithmic" };
+			ImGui::SetNextItemWidth( 330 );
+			if ( ImGui::Combo( "Depth curve", &curveIndex, curveNames, ARRAYSIZE( curveNames ) ) )
+			{
+				const LONG newCurve = ( curveIndex == 1 ) ? ART_DEPTH_CURVE_LOGARITHMIC : ART_DEPTH_CURVE_LINEAR;
+				InterlockedExchange( &g_nArtDepthCurve, newCurve );
+				IssueCommand( "art_depth_curve %s", ( newCurve == ART_DEPTH_CURVE_LOGARITHMIC ) ? "log" : "linear" );
+			}
+
+			float depthVal = art_depth_start.GetFloat();
+			float depthValMax = art_depth_end.GetFloat();
+			ImGui::SetNextItemWidth( 330 );
+			if ( ImGui::DragFloat( "DepthVal (Near)", &depthVal, 5.0f, 0.0f, 100000.0f, "%.0f" ) )
+			{
+				art_depth_start.SetValue( depthVal );
+				IssueCommand( "art_depth_start %.3f", depthVal );
+			}
+			ImGui::SetNextItemWidth( 330 );
+			if ( ImGui::DragFloat( "DepthValMax (Far)", &depthValMax, 5.0f, 0.0f, 100000.0f, "%.0f" ) )
+			{
+				art_depth_end.SetValue( depthValMax );
+				IssueCommand( "art_depth_end %.3f", depthValMax );
+			}
+
+			if ( IsD3D9IntzSupported() )
+			{
+				ImGui::TextColored( ImVec4( 0.35f, 0.95f, 0.35f, 1.0f ), "[Hardware D3D9 Ready (INTZ Buffer Active)]" );
+			}
+			else
+			{
+				ImGui::TextColored( ImVec4( 0.95f, 0.35f, 0.35f, 1.0f ), "[INTZ FourCC not supported by GPU driver]" );
+			}
+			TextDisabledWrapped( "Hardware mode extracts the raw Z-buffer directly from the GPU via INTZ FourCC depth texture substitution, completely eliminating fog and lighting artifacts." );
+		}
+		else
+		{
+			float depthStart = art_depth_start.GetFloat();
+			float depthEnd = art_depth_end.GetFloat();
+			ImGui::SetNextItemWidth( 330 );
+			if ( ImGui::DragFloat( "Depth start", &depthStart, 5.0f, 0.0f, 100000.0f, "%.0f" ) )
+			{
+				art_depth_start.SetValue( depthStart );
+				IssueCommand( "art_depth_start %.3f", depthStart );
+			}
+			ImGui::SetNextItemWidth( 330 );
+			if ( ImGui::DragFloat( "Depth end", &depthEnd, 5.0f, 0.0f, 100000.0f, "%.0f" ) )
+			{
+				art_depth_end.SetValue( depthEnd );
+				IssueCommand( "art_depth_end %.3f", depthEnd );
+			}
+
+			TextDisabledWrapped( "Fog mode renders the scene using Source Engine's white fog ramp between depth start and end." );
+		}
 		TextDisabledWrapped( "Viewmodel and Players use independent chroma colors. Depth fades from black nearby to white far away." );
 
 		ImGui::Spacing();
@@ -4048,7 +4259,7 @@ namespace
 		const bool prefixFinished = ImGui::IsItemDeactivatedAfterEdit();
 		ImGui::SameLine();
 		ImGui::AlignTextToFramePadding();
-		ImGui::TextUnformatted( pPrefixLabel );
+		TextUnformattedSingleLine( pPrefixLabel );
 		if ( prefixSubmitted || prefixFinished )
 			ApplyPrefixField();
 		ImGui::TextWrapped( "Prefix is optional text added before every pass filename. Example: prefix 'shot01' creates shot01_normal_0000.tga; Default creates normal_0000.tga." );
@@ -4086,57 +4297,156 @@ namespace
 			TextDisabledWrapped( "The current take uses the metadata setting captured when recording started." );
 
 		ImGui::Spacing();
-		TextUnformattedWrapped( "Capture pipeline safety" );
+		TextUnformattedWrapped( "Output format & video encoding" );
 		ImGui::Separator();
-		LONG compressionMode = InterlockedCompareExchange( &g_nArtTgaCompressionMode, 0, 0 );
-		int compressionSelection = compressionMode >= ART_TGA_COMPRESSION_OFF &&
-			compressionMode <= ART_TGA_COMPRESSION_RLE ? static_cast<int>( compressionMode ) :
-			ART_TGA_COMPRESSION_AUTO;
-		static const char *compressionNames[] = { "Off (uncompressed)", "Auto (smaller result)", "RLE (always)" };
-		ImGui::SetNextItemWidth( 245 );
-		if ( ImGui::Combo( "TGA compression", &compressionSelection,
-			compressionNames, ARRAYSIZE( compressionNames ) ) )
-			IssueCommand( "art_tga_compression %s",
-				ArtTgaCompressionModeName( compressionSelection ) );
+		ImGui::Spacing();
 
-		int maxFiles = static_cast<int>( InterlockedCompareExchange(
-			&g_ArtQueueOptions.maxFiles, 0, 0 ) );
-		int maxMegabytes = static_cast<int>( InterlockedCompareExchange(
-			&g_ArtQueueOptions.maxMegabytes, 0, 0 ) );
-		int reserveMegabytes = static_cast<int>( InterlockedCompareExchange(
-			&g_ArtQueueOptions.reserveMegabytes, 0, 0 ) );
-		ImGui::SetNextItemWidth( 125 );
-		if ( ImGui::InputInt( "Maximum queued files", &maxFiles ) )
+		LONG outputMode = InterlockedCompareExchange( &g_nArtOutputMode, 0, 0 );
+		int modeSelection = ( outputMode == ART_OUTPUT_MODE_FFMPEG ) ? 1 : 0;
+		static const char *outputModeNames[] = { "Image sequences (TGA frames)", "Direct video stream (FFmpeg)" };
+		ImGui::SetNextItemWidth( 320 );
+		ImGui::BeginDisabled( recording );
+		if ( ImGui::Combo( "Capture format", &modeSelection, outputModeNames, ARRAYSIZE( outputModeNames ) ) )
 		{
-			if ( maxFiles < 1 ) maxFiles = 1;
-			if ( maxFiles > 512 ) maxFiles = 512;
-			IssueCommand( "art_queue max_files %d", maxFiles );
+			IssueCommand( "art_output_mode %s", modeSelection == 1 ? "ffmpeg" : "tga" );
 		}
-		ImGui::SetNextItemWidth( 125 );
-		if ( ImGui::InputInt( "Maximum queued MiB", &maxMegabytes ) )
+		ImGui::EndDisabled();
+
+		if ( modeSelection == 1 )
 		{
-			if ( maxMegabytes < 16 ) maxMegabytes = 16;
-			if ( maxMegabytes > 1024 ) maxMegabytes = 1024;
-			IssueCommand( "art_queue max_mb %d", maxMegabytes );
+			ImGui::Spacing();
+			char resolvedPath[MAX_PATH];
+			bool foundOnDisk = false;
+			ResolveArtFfmpegExecutablePath( resolvedPath, sizeof( resolvedPath ), &foundOnDisk );
+
+			TextUnformattedWrapped( "FFmpeg executable:" );
+			ImGui::SameLine();
+			if ( foundOnDisk )
+				ImGui::TextColored( ImVec4( 0.25f, 0.90f, 0.35f, 1.0f ), "[FOUND ON DISK]" );
+			else
+				ImGui::TextColored( ImVec4( 1.0f, 0.45f, 0.30f, 1.0f ), "[NOT FOUND ON DISK]" );
+
+			ImGui::BeginDisabled( recording );
+			ImGui::SetNextItemWidth( ImGui::GetContentRegionAvail().x - 130.0f );
+			const bool pathSubmitted = ImGui::InputTextWithHint( "##ffmpeg_path", "ffmpeg.exe or full path",
+				g_Gui.ffmpegPath, sizeof( g_Gui.ffmpegPath ), ImGuiInputTextFlags_EnterReturnsTrue );
+			if ( pathSubmitted || ImGui::IsItemDeactivatedAfterEdit() )
+				ApplyFfmpegPathField();
+			ImGui::SameLine();
+			if ( ImGui::Button( "Auto-detect", ImVec2( 120, 0 ) ) )
+			{
+				IssueCommand( "art_ffmpeg_path default" );
+				SyncTextFieldsFromGame();
+			}
+			ImGui::EndDisabled();
+
+			TextDisabledWrapped( "Active executable: %s", resolvedPath[0] ? resolvedPath : "unknown" );
+			TextDisabledWrapped( "Note: You can place ffmpeg.exe next to the loader / DLL, in the game folder (cstrike), or system PATH." );
+
+			ImGui::Spacing();
+			LONG currentPreset = InterlockedCompareExchange( &g_nArtFfmpegPreset, 0, 0 );
+			int presetSelection = ( currentPreset >= 0 && currentPreset < GetArtFfmpegPresetCount() ) ? static_cast<int>( currentPreset ) : 0;
+
+			const char *presetNames[ART_FFMPEG_PRESET_COUNT];
+			for ( int i = 0; i < GetArtFfmpegPresetCount(); ++i )
+				presetNames[i] = GetArtFfmpegPresetInfo( i )->displayName;
+
+			ImGui::SetNextItemWidth( 420 );
+			ImGui::BeginDisabled( recording );
+			if ( ImGui::Combo( "Encoding preset", &presetSelection, presetNames, ARRAYSIZE( presetNames ) ) )
+			{
+				IssueCommand( "art_ffmpeg_preset %s", GetArtFfmpegPresetInfo( presetSelection )->name );
+			}
+			ImGui::EndDisabled();
+
+			const ArtFfmpegPresetInfo *pPresetInfo = GetArtFfmpegPresetInfo( presetSelection );
+			ImGui::TextColored( ImVec4( 0.85f, 0.85f, 0.85f, 1.0f ), "%s", pPresetInfo->description );
+
+			if ( presetSelection == ART_FFMPEG_PRESET_CUSTOM )
+			{
+				ImGui::Spacing();
+				TextUnformattedWrapped( "Custom arguments template:" );
+				ImGui::BeginDisabled( recording );
+				ImGui::SetNextItemWidth( -1 );
+				const bool customSubmitted = ImGui::InputText( "##ffmpeg_custom",
+					g_Gui.ffmpegCustomArgs, sizeof( g_Gui.ffmpegCustomArgs ), ImGuiInputTextFlags_EnterReturnsTrue );
+				if ( customSubmitted || ImGui::IsItemDeactivatedAfterEdit() )
+					ApplyFfmpegCustomArgsField();
+				ImGui::EndDisabled();
+				TextDisabledWrapped( "Supported tags: {WIDTH}, {HEIGHT}, {FPS}, {PASS}, {OUTPUT_FILE}, {TAKE_DIR}, {TAKE_NAME}, {FFMPEG}" );
+			}
+
+			ImGui::Spacing();
+			if ( ImGui::Button( "Test FFmpeg setup", ImVec2( 170, 32 ) ) )
+			{
+				RunArtFfmpegTest( g_Gui.ffmpegTestResult );
+				g_Gui.ffmpegTestPerformed = true;
+			}
+			if ( g_Gui.ffmpegTestPerformed )
+			{
+				ImGui::SameLine();
+				if ( g_Gui.ffmpegTestResult.success )
+					ImGui::TextColored( ImVec4( 0.25f, 0.90f, 0.35f, 1.0f ), "%s", g_Gui.ffmpegTestResult.message );
+				else
+					ImGui::TextColored( ImVec4( 1.0f, 0.35f, 0.35f, 1.0f ), "%s", g_Gui.ffmpegTestResult.message );
+			}
 		}
-		ImGui::SetNextItemWidth( 125 );
-		if ( ImGui::InputInt( "Required virtual-memory reserve MiB", &reserveMegabytes ) )
+
+		if ( modeSelection == 0 )
 		{
-			if ( reserveMegabytes < 64 ) reserveMegabytes = 64;
-			if ( reserveMegabytes > 1024 ) reserveMegabytes = 1024;
-			IssueCommand( "art_queue reserve_mb %d", reserveMegabytes );
+			ImGui::Spacing();
+			TextUnformattedWrapped( "Capture pipeline safety (TGA mode)" );
+			ImGui::Separator();
+			LONG compressionMode = InterlockedCompareExchange( &g_nArtTgaCompressionMode, 0, 0 );
+			int compressionSelection = compressionMode >= ART_TGA_COMPRESSION_OFF &&
+				compressionMode <= ART_TGA_COMPRESSION_RLE ? static_cast<int>( compressionMode ) :
+				ART_TGA_COMPRESSION_AUTO;
+			static const char *compressionNames[] = { "Off (uncompressed)", "Auto (smaller result)", "RLE (always)" };
+			ImGui::SetNextItemWidth( 245 );
+			if ( ImGui::Combo( "TGA compression", &compressionSelection,
+				compressionNames, ARRAYSIZE( compressionNames ) ) )
+				IssueCommand( "art_tga_compression %s",
+					ArtTgaCompressionModeName( compressionSelection ) );
+
+			int maxFiles = static_cast<int>( InterlockedCompareExchange(
+				&g_ArtQueueOptions.maxFiles, 0, 0 ) );
+			int maxMegabytes = static_cast<int>( InterlockedCompareExchange(
+				&g_ArtQueueOptions.maxMegabytes, 0, 0 ) );
+			int reserveMegabytes = static_cast<int>( InterlockedCompareExchange(
+				&g_ArtQueueOptions.reserveMegabytes, 0, 0 ) );
+			ImGui::SetNextItemWidth( 125 );
+			if ( ImGui::InputInt( "Maximum queued files", &maxFiles ) )
+			{
+				if ( maxFiles < 1 ) maxFiles = 1;
+				if ( maxFiles > 512 ) maxFiles = 512;
+				IssueCommand( "art_queue max_files %d", maxFiles );
+			}
+			ImGui::SetNextItemWidth( 125 );
+			if ( ImGui::InputInt( "Maximum queued MiB", &maxMegabytes ) )
+			{
+				if ( maxMegabytes < 16 ) maxMegabytes = 16;
+				if ( maxMegabytes > 1024 ) maxMegabytes = 1024;
+				IssueCommand( "art_queue max_mb %d", maxMegabytes );
+			}
+			ImGui::SetNextItemWidth( 125 );
+			if ( ImGui::InputInt( "Required virtual-memory reserve MiB", &reserveMegabytes ) )
+			{
+				if ( reserveMegabytes < 64 ) reserveMegabytes = 64;
+				if ( reserveMegabytes > 1024 ) reserveMegabytes = 1024;
+				IssueCommand( "art_queue reserve_mb %d", reserveMegabytes );
+			}
+			char pendingQueueBytes[48];
+			FormatArtByteCount( g_ArtPipelineStats.pendingBytes,
+				pendingQueueBytes, sizeof( pendingQueueBytes ) );
+			ImGui::Text( "Pending upper bound: %lu files | %s | take flushes: %lu",
+				g_ArtPipelineStats.pendingFiles, pendingQueueBytes, g_ArtPipelineStats.takeFlushes );
+			if ( ImGui::Button( "Flush queued writes", ImVec2( 170, 30 ) ) )
+				IssueCommandWithSeparator( "art_queue flush" );
+			ImGui::SameLine();
+			if ( ImGui::Button( "Restore safety defaults", ImVec2( 180, 30 ) ) )
+				IssueCommand( "art_queue default" );
+			TextDisabledWrapped( "ART pauses when a queue limit or memory reserve is reached, then continues safely." );
 		}
-		char pendingQueueBytes[48];
-		FormatArtByteCount( g_ArtPipelineStats.pendingBytes,
-			pendingQueueBytes, sizeof( pendingQueueBytes ) );
-		ImGui::Text( "Pending upper bound: %lu files | %s | take flushes: %lu",
-			g_ArtPipelineStats.pendingFiles, pendingQueueBytes, g_ArtPipelineStats.takeFlushes );
-		if ( ImGui::Button( "Flush queued writes", ImVec2( 170, 30 ) ) )
-			IssueCommandWithSeparator( "art_queue flush" );
-		ImGui::SameLine();
-		if ( ImGui::Button( "Restore safety defaults", ImVec2( 180, 30 ) ) )
-			IssueCommand( "art_queue default" );
-		TextDisabledWrapped( "ART pauses when a queue limit or memory reserve is reached, then continues safely." );
 
 		ImGui::Spacing();
 		TextUnformattedWrapped( "Takes" );
@@ -5644,8 +5954,7 @@ namespace
 		ImGui::EndChild();
 
 		ImGui::Spacing();
-		const float advancedSettingsHeight =
-			g_Gui.experimentalOptionsEnabled ? 230.0f : 180.0f;
+		const float advancedSettingsHeight = 285.0f;
 		ImGui::BeginChild( "advanced_settings", ImVec2( 0, advancedSettingsHeight ), ImGuiChildFlags_Borders );
 		TextUnformattedWrapped( "Diagnostics and experimental" );
 		bool statisticsOverlay = InterlockedCompareExchange(
@@ -5654,21 +5963,23 @@ namespace
 			IssueCommand( "art_overlay %s", statisticsOverlay ? "on" : "off" );
 		TextDisabledWrapped( "Orange while idle, red while recording; excluded from recorded TGAs." );
 		ImGui::Separator();
+		bool autoResumeDemo = g_Gui.autoResumeDemoOnRecordingStart;
+		if ( ImGui::Checkbox( "Unpause demo on recording start", &autoResumeDemo ) )
+			IssueCommand( "art_demo_unpause_on_recording %s", autoResumeDemo ? "on" : "off" );
+		TextDisabledWrapped( "Automatically executes demo_resume when recording starts." );
+		bool autoPauseDemoAfterRecording = g_Gui.autoPauseDemoAfterRecording;
+		if ( ImGui::Checkbox( "Pause demo after recording stops",
+			&autoPauseDemoAfterRecording ) )
+		{
+			IssueCommand( "art_demo_pause_after_recording %s",
+				autoPauseDemoAfterRecording ? "on" : "off" );
+		}
+		TextDisabledWrapped( "When a demo is playing, ART requests demo_pause before flushing queued footage." );
+		ImGui::Separator();
 		bool experimentalOptionsEnabled = g_Gui.experimentalOptionsEnabled;
 		if ( ImGui::Checkbox( "Enable experimental options", &experimentalOptionsEnabled ) )
 			IssueCommand( "art_gui_experimental %s", experimentalOptionsEnabled ? "on" : "off" );
 		TextDisabledWrapped( "Shows unfinished or less-tested controls." );
-		if ( g_Gui.experimentalOptionsEnabled )
-		{
-			bool autoPauseDemoAfterRecording = g_Gui.autoPauseDemoAfterRecording;
-			if ( ImGui::Checkbox( "Pause demo after recording stops (experimental)",
-				&autoPauseDemoAfterRecording ) )
-			{
-				IssueCommand( "art_demo_pause_after_recording %s",
-					autoPauseDemoAfterRecording ? "on" : "off" );
-			}
-			TextDisabledWrapped( "When a demo is playing, ART requests demo_pause before flushing queued footage." );
-		}
 		ImGui::Separator();
 		bool debugLogging = IsDebugLoggingEnabled();
 		if ( ImGui::Checkbox( "Diagnostic logging", &debugLogging ) )
@@ -6559,10 +6870,24 @@ namespace
 		InterlockedExchange( &g_nGuiFrameActive, FALSE );
 	}
 
+	HRESULT WINAPI HookedCreateDepthStencilSurface( IDirect3DDevice9 *pDevice, UINT Width, UINT Height,
+		D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard,
+		IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle )
+	{
+		return HandleD3D9CreateDepthStencilSurface( pDevice, Width, Height, Format, MultiSample,
+			MultisampleQuality, Discard, ppSurface, pSharedHandle, g_pOriginalCreateDepthStencilSurface );
+	}
+
+	HRESULT WINAPI HookedSetDepthStencilSurface( IDirect3DDevice9 *pDevice, IDirect3DSurface9 *pNewZStencil )
+	{
+		return HandleD3D9SetDepthStencilSurface( pDevice, pNewZStencil, g_pOriginalSetDepthStencilSurface );
+	}
+
 	HRESULT WINAPI HookedReset( IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS *pParameters )
 	{
 		if ( InterlockedCompareExchange( &g_bArtGuiTerminating, FALSE, FALSE ) )
 			return g_pOriginalReset ? g_pOriginalReset( pDevice, pParameters ) : D3DERR_INVALIDCALL;
+		HandleD3D9Reset();
 		const bool guiDevice = g_Gui.imguiReady && pDevice == g_pGuiDevice;
 		if ( guiDevice )
 			ImGui_ImplDX9_InvalidateDeviceObjects();
@@ -6576,6 +6901,7 @@ namespace
 	{
 		if ( InterlockedCompareExchange( &g_bArtGuiTerminating, FALSE, FALSE ) )
 			return g_pOriginalEndScene ? g_pOriginalEndScene( pDevice ) : D3D_OK;
+		UpdateDemoTickTracking();
 		if ( InterlockedCompareExchange( &g_nPresentFallbackGuard, 0, 0 ) == 0 )
 		{
 			InterlockedIncrement( &g_nEndSceneHookCalls );
@@ -6615,7 +6941,18 @@ namespace
 		InterlockedIncrement( &g_nPresentHookCalls );
 		const bool outermostPresent = InterlockedIncrement( &g_nPresentNesting ) == 1;
 		if ( outermostPresent )
+		{
+			D3DVIEWPORT9 currentVp = {};
+			if ( pDevice && SUCCEEDED( pDevice->GetViewport( &currentVp ) ) && currentVp.Width > 0 && currentVp.Height > 0 )
+			{
+				HandleD3D9Present( pDevice, currentVp.Width, currentVp.Height );
+			}
+			else
+			{
+				HandleD3D9Present( pDevice, 0, 0 );
+			}
 			RenderPresentFallback( pDevice );
+		}
 		const HRESULT result = g_pOriginalPresent ? g_pOriginalPresent( pDevice, pSourceRect, pDestRect,
 			hDestWindowOverride, pDirtyRegion ) : D3D_OK;
 		InterlockedDecrement( &g_nPresentNesting );
@@ -7142,6 +7479,17 @@ namespace
 			MH_RemoveHook( g_pGetCursorPosTarget );
 		}
 
+		if ( g_bSetDepthStencilSurfaceHookCreated )
+		{
+			MH_DisableHook( g_pSetDepthStencilSurfaceTarget );
+			MH_RemoveHook( g_pSetDepthStencilSurfaceTarget );
+		}
+		if ( g_bCreateDepthStencilSurfaceHookCreated )
+		{
+			MH_DisableHook( g_pCreateDepthStencilSurfaceTarget );
+			MH_RemoveHook( g_pCreateDepthStencilSurfaceTarget );
+		}
+
 		if ( g_bSwapChainPresentHookCreated )
 		{
 			MH_DisableHook( g_pSwapChainPresentTarget );
@@ -7163,12 +7511,15 @@ namespace
 			MH_RemoveHook( g_pResetTarget );
 		}
 		MH_Uninitialize();
+		ShutdownD3D9Depth();
 
 		g_bMinHookInitialized = false;
 		g_bResetHookCreated = false;
 		g_bPresentHookCreated = false;
 		g_bEndSceneHookCreated = false;
 		g_bSwapChainPresentHookCreated = false;
+		g_bCreateDepthStencilSurfaceHookCreated = false;
+		g_bSetDepthStencilSurfaceHookCreated = false;
 		g_bGetCursorPosHookCreated = false;
 		g_bSetCursorPosHookCreated = false;
 		g_bClipCursorHookCreated = false;
@@ -7177,6 +7528,8 @@ namespace
 		g_pPresentTarget = NULL;
 		g_pEndSceneTarget = NULL;
 		g_pSwapChainPresentTarget = NULL;
+		g_pCreateDepthStencilSurfaceTarget = NULL;
+		g_pSetDepthStencilSurfaceTarget = NULL;
 		g_pGetCursorPosTarget = NULL;
 		g_pSetCursorPosTarget = NULL;
 		g_pClipCursorTarget = NULL;
@@ -7185,6 +7538,8 @@ namespace
 		g_pOriginalPresent = NULL;
 		g_pOriginalEndScene = NULL;
 		g_pOriginalSwapChainPresent = NULL;
+		g_pOriginalCreateDepthStencilSurface = NULL;
+		g_pOriginalSetDepthStencilSurface = NULL;
 		g_pOriginalGetCursorPos = NULL;
 		g_pOriginalSetCursorPos = NULL;
 		g_pOriginalClipCursor = NULL;
@@ -7258,12 +7613,16 @@ namespace
 			return false;
 		}
 
+		InitializeD3D9Depth( pD3D );
+
 		void **pDeviceVtable = *reinterpret_cast<void ***>( pDevice );
 		void **pSwapChainVtable = *reinterpret_cast<void ***>( pSwapChain );
 		g_pResetTarget = pDeviceVtable[kD3D9ResetIndex];
 		g_pPresentTarget = pDeviceVtable[kD3D9PresentIndex];
 		g_pEndSceneTarget = pDeviceVtable[kD3D9EndSceneIndex];
 		g_pSwapChainPresentTarget = pSwapChainVtable[kD3D9SwapChainPresentIndex];
+		g_pCreateDepthStencilSurfaceTarget = pDeviceVtable[kD3D9CreateDepthStencilSurfaceIndex];
+		g_pSetDepthStencilSurfaceTarget = pDeviceVtable[kD3D9SetDepthStencilSurfaceIndex];
 
 		HMODULE hUser32 = GetModuleHandleA( "user32.dll" );
 		g_pGetCursorPosTarget = hUser32 ? reinterpret_cast<void *>( GetProcAddress( hUser32, "GetCursorPos" ) ) : NULL;
@@ -7306,6 +7665,12 @@ namespace
 			CreateQueuedHook( g_pSwapChainPresentTarget, reinterpret_cast<void *>( HookedSwapChainPresent ),
 				reinterpret_cast<void **>( &g_pOriginalSwapChainPresent ), &g_bSwapChainPresentHookCreated,
 				"swap-chain Present" ) &&
+			CreateQueuedHook( g_pCreateDepthStencilSurfaceTarget, reinterpret_cast<void *>( HookedCreateDepthStencilSurface ),
+				reinterpret_cast<void **>( &g_pOriginalCreateDepthStencilSurface ), &g_bCreateDepthStencilSurfaceHookCreated,
+				"CreateDepthStencilSurface" ) &&
+			CreateQueuedHook( g_pSetDepthStencilSurfaceTarget, reinterpret_cast<void *>( HookedSetDepthStencilSurface ),
+				reinterpret_cast<void **>( &g_pOriginalSetDepthStencilSurface ), &g_bSetDepthStencilSurfaceHookCreated,
+				"SetDepthStencilSurface" ) &&
 			CreateQueuedHook( g_pGetCursorPosTarget, reinterpret_cast<void *>( HookedGetCursorPos ),
 				reinterpret_cast<void **>( &g_pOriginalGetCursorPos ), &g_bGetCursorPosHookCreated,
 				"GetCursorPos" ) &&
@@ -7342,8 +7707,9 @@ namespace
 			return false;
 		}
 
-		LogMessage( "GUI DETOURS READY: reset=%p present=%p end_scene=%p swap_present=%p get_cursor_pos=%p set_cursor_pos=%p clip_cursor=%p set_cursor=%p minhook=%s",
+		LogMessage( "GUI DETOURS READY: reset=%p present=%p end_scene=%p swap_present=%p depth_surface=%p set_depth_surface=%p get_cursor_pos=%p set_cursor_pos=%p clip_cursor=%p set_cursor=%p minhook=%s",
 			g_pResetTarget, g_pPresentTarget, g_pEndSceneTarget, g_pSwapChainPresentTarget,
+			g_pCreateDepthStencilSurfaceTarget, g_pSetDepthStencilSurfaceTarget,
 			g_pGetCursorPosTarget, g_pSetCursorPosTarget,
 			g_pClipCursorTarget, g_pSetCursorTarget, kMinHookVersionPinned );
 		return true;
@@ -7734,9 +8100,29 @@ namespace
 		}
 
 		g_Gui.autoPauseDemoAfterRecording = IsTruthy( g_pEngine->Cmd_Argv( 1 ) );
-		ArtConsoleMessage( "art_demo_pause_after_recording: %s%s.\n",
-			g_Gui.autoPauseDemoAfterRecording ? "on" : "off",
-			g_Gui.experimentalOptionsEnabled ? "" : " (inactive until experimental options are enabled)" );
+		ArtConsoleMessage( "art_demo_pause_after_recording: %s.\n",
+			g_Gui.autoPauseDemoAfterRecording ? "on" : "off" );
+	}
+
+	void ArtDemoUnpauseOnRecording_f()
+	{
+		const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+		if ( argc <= 1 )
+		{
+			ArtConsoleMessage( "art_demo_unpause_on_recording is %s. Usage: art_demo_unpause_on_recording <on|off>.\n",
+				g_Gui.autoResumeDemoOnRecordingStart ? "on" : "off" );
+			return;
+		}
+		if ( argc != 2 || ( !IsTruthy( g_pEngine->Cmd_Argv( 1 ) ) &&
+			!IsFalsy( g_pEngine->Cmd_Argv( 1 ) ) ) )
+		{
+			ArtConsoleMessage( "Usage: art_demo_unpause_on_recording <on|off>.\n" );
+			return;
+		}
+
+		g_Gui.autoResumeDemoOnRecordingStart = IsTruthy( g_pEngine->Cmd_Argv( 1 ) );
+		ArtConsoleMessage( "art_demo_unpause_on_recording: %s.\n",
+			g_Gui.autoResumeDemoOnRecordingStart ? "on" : "off" );
 	}
 
 	void ArtPlayersThroughWalls_f()
@@ -8101,7 +8487,10 @@ namespace
 		"Set the hold key used for mirv_input control while the ART GUI remains open." );
 	ConCommand g_ArtDemoPauseAfterRecordingCommand( "art_demo_pause_after_recording",
 		ArtDemoPauseAfterRecording_f,
-		"Pause demo playback automatically when recording stops (experimental)." );
+		"Pause demo playback automatically when recording stops." );
+	ConCommand g_ArtDemoUnpauseOnRecordingCommand( "art_demo_unpause_on_recording",
+		ArtDemoUnpauseOnRecording_f,
+		"Unpause demo playback automatically when recording starts." );
 	ConCommand g_ArtChamsCommand( "art_chams", ArtChams_f,
 		"Enable flat colors for players, viewmodel, and skybox." );
 	ConCommand g_ArtPlayersThroughWallsCommand( "art_players_through_walls", ArtPlayersThroughWalls_f,
@@ -8163,13 +8552,23 @@ namespace
 
 bool PauseArtDemoAfterRecordingIfEnabled()
 {
-	if ( !g_Gui.experimentalOptionsEnabled || !g_Gui.autoPauseDemoAfterRecording ||
+	if ( !g_Gui.autoPauseDemoAfterRecording ||
 		!g_pEngine || !g_pEngine->IsPlayingDemo() )
 	{
 		return false;
 	}
 	IssueCommand( "demo_pause" );
-	LogMessage( "DEMO AUTO-PAUSE REQUESTED: reason=recording_stopped experimental=1" );
+	LogMessage( "DEMO AUTO-PAUSE REQUESTED: reason=recording_stopped" );
+	return true;
+}
+
+bool ResumeArtDemoBeforeRecordingIfEnabled()
+{
+	if ( !g_Gui.autoResumeDemoOnRecordingStart || !g_pEngine || !g_pEngine->IsPlayingDemo() )
+		return false;
+
+	IssueCommand( "demo_resume" );
+	LogMessage( "DEMO AUTO-RESUME REQUESTED: reason=recording_started" );
 	return true;
 }
 
@@ -8410,6 +8809,7 @@ bool InstallArtGui()
 	RegisterGuiCommand( &g_ArtHlaeInputWhileGuiCommand );
 	RegisterGuiCommand( &g_ArtHlaeInputHoldKeyCommand );
 	RegisterGuiCommand( &g_ArtDemoPauseAfterRecordingCommand );
+	RegisterGuiCommand( &g_ArtDemoUnpauseOnRecordingCommand );
 	RegisterGuiCommand( &g_ArtChamsCommand );
 	RegisterGuiCommand( &g_ArtPlayersThroughWallsCommand );
 	RegisterGuiCommand( &g_ArtPlayersWorldWeaponsCommand );
@@ -8504,5 +8904,10 @@ void SetArtGuiVisible( bool visible )
 				MAKELPARAM( HTCLIENT, WM_MOUSEMOVE ) );
 	}
 	LogMessage( "GUI VISIBILITY: %s", visible ? "on" : "off" );
+}
+
+IDirect3DDevice9 *GetArtGuiDevice()
+{
+	return g_pGuiDevice;
 }
 }

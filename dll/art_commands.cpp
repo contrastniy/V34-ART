@@ -3,6 +3,8 @@
 #include "art_internal.h"
 #include "art_gui.h"
 #include "art_hlae.h"
+#include "art_ffmpeg.h"
+#include "art_d3d9_depth.h"
 
 // memdbgon must be the last include file in a .cpp file.
 #include "tier0/memdbgon.h"
@@ -118,6 +120,7 @@ namespace art
 			}
 
 			g_nFrame = 0;
+			const bool demoResumeRequested = ResumeArtDemoBeforeRecordingIfEnabled();
 			BeginArtRecordingStatistics( recordMask, hudMask );
 			BeginArtHlaeTakeExports();
 			InterlockedExchange( &g_bRecording, TRUE );
@@ -131,6 +134,8 @@ namespace art
 				g_flViewmodelFov,
 				art_depth_start.GetFloat(), art_depth_end.GetFloat() );
 			ArtConsoleMessage( "art: recording started: %s\n", displayPath );
+			if ( demoResumeRequested )
+				ArtConsoleMessage( "art: demo unpause requested on recording start.\n" );
 			PrintRecordMask( recordMask );
 			PrintRecordPath();
 			PrintCapturePrefix();
@@ -159,6 +164,7 @@ namespace art
 
 			const bool demoPauseRequested = PauseArtDemoAfterRecordingIfEnabled();
 			EndArtHlaeTakeExports();
+			FinishArtFfmpegPipes( false );
 			FlushArtWriteQueue( "art_stop", true );
 			FinishArtRecordingStatistics( false );
 			char displayPath[MAX_PATH];
@@ -196,16 +202,16 @@ namespace art
 				art_depth_start.GetFloat(), art_depth_end.GetFloat() );
 			if ( InterlockedCompareExchange( &g_bRecording, FALSE, FALSE ) )
 			{
-				ArtConsoleMessage( "art: recording frame %d to %s; preview %s; Viewmodel RGB %d %d %d; Players RGB %d %d %d; viewmodel FOV %g; fog depth start %g end %g.\n",
-					g_nFrame, displayPath, PreviewName( preview ),
+				ArtConsoleMessage( "art: recording frame %d to %s; preview %s; depth mode %s; Viewmodel RGB %d %d %d; Players RGB %d %d %d; viewmodel FOV %g; depth start %g end %g.\n",
+					g_nFrame, displayPath, PreviewName( preview ), GetArtDepthModeName( InterlockedCompareExchange( &g_nArtDepthMode, 0, 0 ) ),
 					g_nViewmodelBackgroundRed, g_nViewmodelBackgroundGreen, g_nViewmodelBackgroundBlue,
 					g_nPlayersBackgroundRed, g_nPlayersBackgroundGreen, g_nPlayersBackgroundBlue,
 					g_flViewmodelFov, art_depth_start.GetFloat(), art_depth_end.GetFloat() );
 			}
 			else
 			{
-				ArtConsoleMessage( "art: idle; preview %s; standalone hook is loaded; Viewmodel RGB %d %d %d; Players RGB %d %d %d; viewmodel FOV %g; fog depth start %g end %g.\n",
-					PreviewName( preview ),
+				ArtConsoleMessage( "art: idle; preview %s; depth mode %s; standalone hook is loaded; Viewmodel RGB %d %d %d; Players RGB %d %d %d; viewmodel FOV %g; depth start %g end %g.\n",
+					PreviewName( preview ), GetArtDepthModeName( InterlockedCompareExchange( &g_nArtDepthMode, 0, 0 ) ),
 					g_nViewmodelBackgroundRed, g_nViewmodelBackgroundGreen, g_nViewmodelBackgroundBlue,
 					g_nPlayersBackgroundRed, g_nPlayersBackgroundGreen, g_nPlayersBackgroundBlue,
 					g_flViewmodelFov, art_depth_start.GetFloat(), art_depth_end.GetFloat() );
@@ -914,6 +920,254 @@ namespace art
 			ArtConsoleMessage( "art_debug: '%s' is invalid; expected 'on' or 'off'.\n", pMode );
 		}
 
+		void ArtOutputMode_f()
+		{
+			const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+			const LONG currentMode = InterlockedCompareExchange( &g_nArtOutputMode, 0, 0 );
+			if ( argc == 1 )
+			{
+				ArtConsoleMessage( "art_output_mode: current mode is '%s'. Usage: art_output_mode <tga|ffmpeg>.\n",
+					GetArtOutputModeName( currentMode ) );
+				return;
+			}
+			if ( InterlockedCompareExchange( &g_bRecording, FALSE, FALSE ) )
+			{
+				ArtConsoleMessage( "art_output_mode: cannot change output mode while recording.\n" );
+				return;
+			}
+			const char *pMode = g_pEngine->Cmd_Argv( 1 );
+			const LONG newMode = ArtOutputModeFromName( pMode );
+			InterlockedExchange( &g_nArtOutputMode, newMode );
+			LogMessage( "OUTPUT MODE CHANGED: mode='%s'", GetArtOutputModeName( newMode ) );
+			ArtConsoleMessage( "art_output_mode: mode set to '%s'.\n", GetArtOutputModeName( newMode ) );
+		}
+
+		void ArtFfmpegPath_f()
+		{
+			const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+			if ( argc == 1 )
+			{
+				char resolved[MAX_PATH];
+				bool onDisk = false;
+				ResolveArtFfmpegExecutablePath( resolved, sizeof( resolved ), &onDisk );
+				ArtConsoleMessage( "art_ffmpeg_path: configured='%s', resolved='%s' (%s).\n",
+					g_szArtFfmpegPath, resolved, onDisk ? "found on disk" : "not found on disk" );
+				ArtConsoleMessage( "Usage: art_ffmpeg_path <path|default>.\n" );
+				return;
+			}
+			if ( InterlockedCompareExchange( &g_bRecording, FALSE, FALSE ) )
+			{
+				ArtConsoleMessage( "art_ffmpeg_path: cannot change path while recording.\n" );
+				return;
+			}
+			const char *pPath = g_pEngine->Cmd_Argv( 1 );
+			if ( !Q_stricmp( pPath, "default" ) )
+				Q_strncpy( g_szArtFfmpegPath, "ffmpeg.exe", sizeof( g_szArtFfmpegPath ) );
+			else
+				Q_strncpy( g_szArtFfmpegPath, pPath, sizeof( g_szArtFfmpegPath ) );
+
+			char resolved[MAX_PATH];
+			bool onDisk = false;
+			ResolveArtFfmpegExecutablePath( resolved, sizeof( resolved ), &onDisk );
+			LogMessage( "FFMPEG PATH SET: raw='%s' resolved='%s' on_disk=%d", g_szArtFfmpegPath, resolved, onDisk ? 1 : 0 );
+			ArtConsoleMessage( "art_ffmpeg_path: set to '%s' (resolved: '%s', %s).\n",
+				g_szArtFfmpegPath, resolved, onDisk ? "found on disk" : "not found on disk" );
+		}
+
+		void ArtFfmpegPreset_f()
+		{
+			const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+			const LONG currentPreset = InterlockedCompareExchange( &g_nArtFfmpegPreset, 0, 0 );
+			if ( argc == 1 )
+			{
+				ArtConsoleMessage( "art_ffmpeg_preset: current preset is '%s' (%s).\n",
+					GetArtFfmpegPresetName( currentPreset ),
+					GetArtFfmpegPresetInfo( currentPreset )->displayName );
+				ArtConsoleMessage( "Available presets:\n" );
+				for ( int i = 0; i < GetArtFfmpegPresetCount(); ++i )
+				{
+					const ArtFfmpegPresetInfo *pInfo = GetArtFfmpegPresetInfo( i );
+					ArtConsoleMessage( "  %-14s %s\n", pInfo->name, pInfo->displayName );
+				}
+				ArtConsoleMessage( "Usage: art_ffmpeg_preset <name>.\n" );
+				return;
+			}
+			if ( InterlockedCompareExchange( &g_bRecording, FALSE, FALSE ) )
+			{
+				ArtConsoleMessage( "art_ffmpeg_preset: cannot change preset while recording.\n" );
+				return;
+			}
+			const char *pName = g_pEngine->Cmd_Argv( 1 );
+			const LONG newPreset = ArtFfmpegPresetFromName( pName );
+			InterlockedExchange( &g_nArtFfmpegPreset, newPreset );
+			const ArtFfmpegPresetInfo *pInfo = GetArtFfmpegPresetInfo( newPreset );
+			LogMessage( "FFMPEG PRESET SET: preset='%s' (%s)", pInfo->name, pInfo->displayName );
+			ArtConsoleMessage( "art_ffmpeg_preset: preset set to '%s' (%s).\n", pInfo->name, pInfo->displayName );
+		}
+
+		void ArtFfmpegCustom_f()
+		{
+			const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+			if ( argc <= 1 )
+			{
+				ArtConsoleMessage( "art_ffmpeg_custom: current custom arguments template:\n  %s\n",
+					g_szArtFfmpegCustomArgs );
+				ArtConsoleMessage( "Usage: art_ffmpeg_custom <args_template> (Supports {WIDTH}, {HEIGHT}, {FPS}, {PASS}, {OUTPUT_FILE}).\n" );
+				return;
+			}
+			if ( InterlockedCompareExchange( &g_bRecording, FALSE, FALSE ) )
+			{
+				ArtConsoleMessage( "art_ffmpeg_custom: cannot change arguments while recording.\n" );
+				return;
+			}
+			char customBuffer[1024] = "";
+			for ( int i = 1; i < argc; ++i )
+			{
+				const char *pArg = g_pEngine->Cmd_Argv( i );
+				if ( i > 1 )
+					Q_strncat( customBuffer, " ", sizeof( customBuffer ), COPY_ALL_CHARACTERS );
+				Q_strncat( customBuffer, pArg ? pArg : "", sizeof( customBuffer ), COPY_ALL_CHARACTERS );
+			}
+			Q_strncpy( g_szArtFfmpegCustomArgs, customBuffer, sizeof( g_szArtFfmpegCustomArgs ) );
+			InterlockedExchange( &g_nArtFfmpegPreset, ART_FFMPEG_PRESET_CUSTOM );
+			LogMessage( "FFMPEG CUSTOM ARGS SET: '%s'", g_szArtFfmpegCustomArgs );
+			ArtConsoleMessage( "art_ffmpeg_custom: updated custom arguments template and switched preset to 'custom'.\n" );
+		}
+
+		void ArtFfmpegTest_f()
+		{
+			ArtConsoleMessage( "art_ffmpeg_test: validating FFmpeg executable and arguments...\n" );
+			ArtFfmpegTestResult result;
+			RunArtFfmpegTest( result );
+			ArtConsoleMessage( "art_ffmpeg_test: %s (path: '%s') -> %s\n",
+				result.success ? "SUCCESS" : "FAILURE",
+				result.resolvedPath, result.message );
+		}
+
+		void ArtFfmpegStatus_f()
+		{
+			char resolved[MAX_PATH];
+			bool onDisk = false;
+			ResolveArtFfmpegExecutablePath( resolved, sizeof( resolved ), &onDisk );
+			const LONG currentMode = InterlockedCompareExchange( &g_nArtOutputMode, 0, 0 );
+			const LONG currentPreset = InterlockedCompareExchange( &g_nArtFfmpegPreset, 0, 0 );
+			const ArtFfmpegPresetInfo *pInfo = GetArtFfmpegPresetInfo( currentPreset );
+
+			ArtConsoleMessage( "--- ART FFmpeg Status ---\n" );
+			ArtConsoleMessage( "  Output mode: %s\n", GetArtOutputModeName( currentMode ) );
+			ArtConsoleMessage( "  Executable configured: '%s'\n", g_szArtFfmpegPath );
+			ArtConsoleMessage( "  Executable resolved:   '%s' (%s)\n", resolved, onDisk ? "FOUND ON DISK" : "NOT FOUND" );
+			ArtConsoleMessage( "  Active preset:         '%s' (%s, .%s)\n", pInfo->name, pInfo->displayName, GetArtFfmpegPassOutputExtension( currentPreset ) );
+			if ( currentPreset == ART_FFMPEG_PRESET_CUSTOM )
+				ArtConsoleMessage( "  Custom template:       %s\n", g_szArtFfmpegCustomArgs );
+			ArtConsoleMessage( "  Active pipe status:    %s\n", AreArtFfmpegPipesActive() ? "ACTIVE" : "IDLE" );
+		}
+
+		void ArtDepthMode_f()
+		{
+			const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+			const LONG currentMode = InterlockedCompareExchange( &g_nArtDepthMode, 0, 0 );
+			if ( argc == 1 )
+			{
+				ArtConsoleMessage( "art_depth_mode is '%s' (hardware D3D9 INTZ supported: %s, capture ready: %s).\n",
+					GetArtDepthModeName( currentMode ),
+					IsD3D9IntzSupported() ? "yes" : "no",
+					IsD3D9DepthCaptureReady() ? "yes" : "no" );
+				ArtConsoleMessage( "Usage: art_depth_mode <fog|d3d9|precise>.\n" );
+				return;
+			}
+			if ( argc != 2 )
+			{
+				ArtConsoleMessage( "Usage: art_depth_mode <fog|d3d9|precise>.\n" );
+				return;
+			}
+			const char *pMode = g_pEngine->Cmd_Argv( 1 );
+			const LONG newMode = ArtDepthModeFromName( pMode );
+			InterlockedExchange( &g_nArtDepthMode, newMode );
+			if ( newMode == ART_DEPTH_MODE_D3D9 )
+			{
+				EnsureActiveDepthSurfaceIsIntz( GetArtGuiDevice() );
+			}
+			LogMessage( "DEPTH MODE CHANGED: mode='%s'", GetArtDepthModeName( newMode ) );
+			ArtConsoleMessage( "art_depth_mode: mode set to '%s'%s.\n",
+				GetArtDepthModeName( newMode ),
+				( newMode == ART_DEPTH_MODE_D3D9 && !IsD3D9IntzSupported() ) ? " (warning: INTZ not supported by GPU)" : "" );
+		}
+
+		void ArtDepthCurve_f()
+		{
+			const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+			const LONG currentCurve = InterlockedCompareExchange( &g_nArtDepthCurve, 0, 0 );
+			if ( argc == 1 )
+			{
+				ArtConsoleMessage( "art_depth_curve is '%s'. Usage: art_depth_curve <linear|log|logarithmic>.\n",
+					GetArtDepthCurveName( currentCurve ) );
+				return;
+			}
+			if ( argc != 2 )
+			{
+				ArtConsoleMessage( "Usage: art_depth_curve <linear|log|logarithmic>.\n" );
+				return;
+			}
+			const char *pCurve = g_pEngine->Cmd_Argv( 1 );
+			const LONG newCurve = ArtDepthCurveFromName( pCurve );
+			InterlockedExchange( &g_nArtDepthCurve, newCurve );
+			LogMessage( "DEPTH CURVE CHANGED: curve='%s'", GetArtDepthCurveName( newCurve ) );
+			ArtConsoleMessage( "art_depth_curve: curve set to '%s'.\n", GetArtDepthCurveName( newCurve ) );
+		}
+
+		void ArtDepthVal_f()
+		{
+			const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+			if ( argc == 1 )
+			{
+				ArtConsoleMessage( "art_depth_val is %g (alias of art_depth_start). Usage: art_depth_val <distance>.\n",
+					art_depth_start.GetFloat() );
+				return;
+			}
+			if ( argc != 2 )
+			{
+				ArtConsoleMessage( "Usage: art_depth_val <distance>.\n" );
+				return;
+			}
+			char *pEnd = NULL;
+			const float val = static_cast<float>( strtod( g_pEngine->Cmd_Argv( 1 ), &pEnd ) );
+			if ( !pEnd || *pEnd != '\0' || val < 0.0f )
+			{
+				ArtConsoleMessage( "art_depth_val: invalid distance value.\n" );
+				return;
+			}
+			art_depth_start.SetValue( val );
+			LogMessage( "DEPTH VAL CHANGED: depth_val=%g", val );
+			ArtConsoleMessage( "art_depth_val: set to %g.\n", val );
+		}
+
+		void ArtDepthValMax_f()
+		{
+			const int argc = g_pEngine ? g_pEngine->Cmd_Argc() : 0;
+			if ( argc == 1 )
+			{
+				ArtConsoleMessage( "art_depth_val_max is %g (alias of art_depth_end). Usage: art_depth_val_max <distance>.\n",
+					art_depth_end.GetFloat() );
+				return;
+			}
+			if ( argc != 2 )
+			{
+				ArtConsoleMessage( "Usage: art_depth_val_max <distance>.\n" );
+				return;
+			}
+			char *pEnd = NULL;
+			const float val = static_cast<float>( strtod( g_pEngine->Cmd_Argv( 1 ), &pEnd ) );
+			if ( !pEnd || *pEnd != '\0' || val < 0.0f )
+			{
+				ArtConsoleMessage( "art_depth_val_max: invalid distance value.\n" );
+				return;
+			}
+			art_depth_end.SetValue( val );
+			LogMessage( "DEPTH VAL MAX CHANGED: depth_val_max=%g", val );
+			ArtConsoleMessage( "art_depth_val_max: set to %g.\n", val );
+		}
+
 		ConCommand art_start( "art_start", ArtStart_f,
 			"Start synchronized multi-pass TGA recording. Usage: art_start [take_name]" );
 		ConCommand art_stop( "art_stop", ArtStop_f,
@@ -924,6 +1178,18 @@ namespace art
 			"Print recorder status." );
 		ConCommand art_stats( "art_stats", ArtStats_f,
 			"Print current/latest take and ART session recording statistics." );
+		ConCommand art_output_mode( "art_output_mode", ArtOutputMode_f,
+			"Set output capture mode. Usage: art_output_mode <tga|ffmpeg>." );
+		ConCommand art_ffmpeg_path( "art_ffmpeg_path", ArtFfmpegPath_f,
+			"Set path to ffmpeg.exe. Usage: art_ffmpeg_path <path|default>." );
+		ConCommand art_ffmpeg_preset( "art_ffmpeg_preset", ArtFfmpegPreset_f,
+			"Set active FFmpeg encoding preset. Usage: art_ffmpeg_preset <prores_422|prores_4444|h264_hq|h264_lossless|nvenc_h264|nvenc_hevc|custom>." );
+		ConCommand art_ffmpeg_custom( "art_ffmpeg_custom", ArtFfmpegCustom_f,
+			"Set custom FFmpeg arguments template. Usage: art_ffmpeg_custom <arguments_template>." );
+		ConCommand art_ffmpeg_test( "art_ffmpeg_test", ArtFfmpegTest_f,
+			"Test FFmpeg executable availability and command template execution." );
+		ConCommand art_ffmpeg_status( "art_ffmpeg_status", ArtFfmpegStatus_f,
+			"Print FFmpeg pipeline status, resolved executable, and active preset." );
 		ConCommand art_queue( "art_queue", ArtQueue_f,
 			"Configure bounded asynchronous capture writes. Usage: art_queue [status|flush|default|max_files <n>|max_mb <n>|reserve_mb <n>]." );
 		ConCommand art_tga_compression( "art_tga_compression", ArtTgaCompression_f,
@@ -948,6 +1214,14 @@ namespace art
 			"Toggle a live pass preview. Usage: art_preview <normal|clear|clear-noplayers|viewmodel|depth|players|objectid|off>." );
 		ConCommand art_preview_next( "art_preview_next", ArtPreviewNext_f,
 			"Advance live preview to the next recording pass." );
+		ConCommand art_depth_mode( "art_depth_mode", ArtDepthMode_f,
+			"Set depth pass extraction method: 'fog' or 'd3d9' / 'precise'. Usage: art_depth_mode <fog|d3d9|precise>." );
+		ConCommand art_depth_curve( "art_depth_curve", ArtDepthCurve_f,
+			"Set depth curve distribution: 'linear' or 'logarithmic' ('log'). Usage: art_depth_curve <linear|log|logarithmic>." );
+		ConCommand art_depth_val( "art_depth_val", ArtDepthVal_f,
+			"Set near depth value (DepthVal / depth start). Usage: art_depth_val <distance>." );
+		ConCommand art_depth_val_max( "art_depth_val_max", ArtDepthValMax_f,
+			"Set far depth value (DepthValMax / depth end). Usage: art_depth_val_max <distance>." );
 		ConCommand art_help( "art_help", ArtHelp_f,
 			"Print the v34_art command reference." );
 		ConCommand art_debug( "art_debug", ArtDebug_f,
@@ -971,7 +1245,13 @@ namespace art
 				!Q_stricmp( pName, "art_players_color" ) || !Q_stricmp( pName, "art_preview" ) ||
 				!Q_stricmp( pName, "art_preview_next" ) ||
 				!Q_stricmp( pName, "art_record" ) || !Q_stricmp( pName, "art_hud" ) ||
+				!Q_stricmp( pName, "art_output_mode" ) || !Q_stricmp( pName, "art_ffmpeg_path" ) ||
+				!Q_stricmp( pName, "art_ffmpeg_preset" ) || !Q_stricmp( pName, "art_ffmpeg_custom" ) ||
+				!Q_stricmp( pName, "art_ffmpeg_test" ) || !Q_stricmp( pName, "art_ffmpeg_status" ) ||
+				!Q_stricmp( pName, "art_demo_unpause_on_recording" ) ||
 				!Q_stricmp( pName, "art_prefix" ) || !Q_stricmp( pName, "art_viewmodel_fov" ) ||
+				!Q_stricmp( pName, "art_depth_mode" ) || !Q_stricmp( pName, "art_depth_curve" ) ||
+				!Q_stricmp( pName, "art_depth_val" ) || !Q_stricmp( pName, "art_depth_val_max" ) ||
 				!Q_stricmp( pName, "art_help" ) || !Q_stricmp( pName, "art_debug" ) ) )
 			{
 				LogMessage( "COMMAND CONFLICT: found existing '%s' at %p after scanning %d entries", pName, pCommand, count );

@@ -3,6 +3,7 @@
 class IVModelRender;
 struct ModelRenderInfo_t;
 class CViewSetup;
+struct IDirect3DDevice9;
 
 namespace art
 {
@@ -22,12 +23,14 @@ namespace art
 	bool IsArtGuiVisible();
 	bool IsArtGuiMirvInputPassthroughActive();
 	void SetArtGuiVisible( bool visible );
+	IDirect3DDevice9 *GetArtGuiDevice();
 
 	// Applies the global FOV override directly to the CViewSetup used by the
 	// recorder render hook. Returns true when the view was modified.
 	bool IsArtGlobalFovOverrideActive();
 	bool ApplyArtGlobalFov( CViewSetup &view );
 	bool PauseArtDemoAfterRecordingIfEnabled();
+	bool ResumeArtDemoBeforeRecordingIfEnabled();
 
 	// Applies no-flash and no-smoke state immediately before Source renders a view.
 	// No-flash clears replicated player flash values; no-smoke suppresses only smoke

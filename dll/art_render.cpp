@@ -3,6 +3,8 @@
 #include "art_gui.h"
 #include "art_internal.h"
 #include "art_hlae.h"
+#include "art_ffmpeg.h"
+#include "art_d3d9_depth.h"
 
 // memdbgon must be the last include file in a .cpp file.
 #include "tier0/memdbgon.h"
@@ -248,6 +250,7 @@ class HidePlayersRenderScope
 		{
 			LogMessage( "RECORDING ERROR: aborting at frame=%d root='%s'", g_nFrame, g_szTakeRoot );
 			InterlockedExchange( &g_bRecording, FALSE );
+			FinishArtFfmpegPipes( true );
 			EndArtHlaeTakeExports();
 			FlushArtWriteQueue( "capture error", true );
 			FinishArtRecordingStatistics( true );
@@ -260,6 +263,7 @@ class HidePlayersRenderScope
 		{
 			LogMessage( "RECORDING ERROR: aborting at frame=%d because GetPlayerView returned no usable view", g_nFrame );
 			InterlockedExchange( &g_bRecording, FALSE );
+			FinishArtFfmpegPipes( true );
 			EndArtHlaeTakeExports();
 			FlushArtWriteQueue( "view setup error", true );
 			FinishArtRecordingStatistics( true );
@@ -354,13 +358,52 @@ class HidePlayersRenderScope
 			}
 			else if ( preview == ART_PREVIEW_DEPTH )
 			{
-				CViewSetup utilityView = view;
-				utilityView.m_bDoBloomAndToneMapping = false;
-				CConVarRestore vars;
-				ApplyDepth( vars );
-				ApplyHudSetting( vars, hudMask, passBit );
-				g_pMaterials->ClearColor4ub( 255, 255, 255, 255 );
-				g_pClient->RenderViewEx( utilityView, clearFlags, AddHudDrawFlag( 0, hudMask, passBit ) );
+				const LONG depthMode = InterlockedCompareExchange( &g_nArtDepthMode, 0, 0 );
+				if ( depthMode == ART_DEPTH_MODE_D3D9 && IsD3D9DepthCaptureReady() )
+				{
+					IDirect3DDevice9 *pDevice = GetArtGuiDevice();
+					if ( pDevice )
+					{
+						EnsureActiveDepthSurfaceIsIntz( pDevice );
+					}
+
+					CViewSetup utilityView = view;
+					utilityView.m_bDoBloomAndToneMapping = false;
+					CConVarRestore vars;
+					ApplyHudSetting( vars, hudMask, passBit );
+					g_pMaterials->ClearColor4ub( 0, 0, 0, 255 );
+					{
+						ArtScopedStageTiming renderTiming( ART_TIMING_RENDER );
+						g_pClient->RenderViewEx( utilityView, clearFlags, AddHudDrawFlag( 0, hudMask, passBit ) );
+					}
+
+					if ( pDevice )
+					{
+						const LONG depthCurve = InterlockedCompareExchange( &g_nArtDepthCurve, 0, 0 );
+						RenderPreciseDepthPreview(
+							pDevice,
+							view.x,
+							view.y,
+							view.width,
+							view.height,
+							view.zNear,
+							view.zFar,
+							art_depth_start.GetFloat(),
+							art_depth_end.GetFloat(),
+							depthCurve
+						);
+					}
+				}
+				else
+				{
+					CViewSetup utilityView = view;
+					utilityView.m_bDoBloomAndToneMapping = false;
+					CConVarRestore vars;
+					ApplyDepth( vars );
+					ApplyHudSetting( vars, hudMask, passBit );
+					g_pMaterials->ClearColor4ub( 255, 255, 255, 255 );
+					g_pClient->RenderViewEx( utilityView, clearFlags, AddHudDrawFlag( 0, hudMask, passBit ) );
+				}
 			}
 			else if ( preview == ART_PREVIEW_CLEAR_NOPLAYERS )
 			{
@@ -448,7 +491,7 @@ class HidePlayersRenderScope
 			if ( previewOnly )
 			{
 				const LONG previewToRender = previewAtEntry == ART_PREVIEW_NONE ? ART_PREVIEW_NORMAL : previewAtEntry;
-		RenderPreviewPass( view, clearFlags, pRect, previewToRender, logRender, "idle" );
+				RenderPreviewPass( view, clearFlags, pRect, previewToRender, logRender, "idle" );
 				InterlockedExchange( &g_bRenderingArt, FALSE );
 				if ( logRender )
 					LogMessage( "RENDER GUARD RELEASED: hook_call=%lu preview_only=1 preview='%s'",
@@ -571,21 +614,51 @@ class HidePlayersRenderScope
 
 			if ( ok && ( recordMask & ART_RECORD_DEPTH ) )
 			{
-				LogMessage( "PASS BEGIN: frame=%d pass='depth' clear_flags=0x%X hud=%d fog_start=%g fog_end=%g",
-					g_nFrame, clearFlags, ( hudMask & ART_RECORD_DEPTH ) ? 1 : 0,
-					art_depth_start.GetFloat(), art_depth_end.GetFloat() );
-				CConVarRestore vars;
-				ApplyDepth( vars );
-				ApplyHudSetting( vars, hudMask, ART_RECORD_DEPTH );
-				g_pMaterials->ClearColor4ub( 255, 255, 255, 255 );
+				const LONG depthMode = InterlockedCompareExchange( &g_nArtDepthMode, 0, 0 );
+				if ( depthMode == ART_DEPTH_MODE_D3D9 && IsD3D9DepthCaptureReady() )
 				{
-					ArtScopedStageTiming renderTiming( ART_TIMING_RENDER );
-					g_pClient->RenderViewEx( utilityView, clearFlags,
-						AddHudDrawFlag( 0, hudMask, ART_RECORD_DEPTH ) );
+					LogMessage( "PASS BEGIN: frame=%d pass='depth' mode=d3d9_precise depth_start=%g depth_end=%g",
+						g_nFrame, art_depth_start.GetFloat(), art_depth_end.GetFloat() );
+
+					IDirect3DDevice9 *pDevice = GetArtGuiDevice();
+					if ( pDevice )
+					{
+						EnsureActiveDepthSurfaceIsIntz( pDevice );
+					}
+
+					CViewSetup utilityView = view;
+					utilityView.m_bDoBloomAndToneMapping = false;
+					CConVarRestore vars;
+					ApplyHudSetting( vars, hudMask, ART_RECORD_DEPTH );
+					g_pMaterials->ClearColor4ub( 0, 0, 0, 255 );
+					{
+						ArtScopedStageTiming renderTiming( ART_TIMING_RENDER );
+						g_pClient->RenderViewEx( utilityView, clearFlags,
+							AddHudDrawFlag( 0, hudMask, ART_RECORD_DEPTH ) );
+					}
+					LogMessage( "PASS RENDER COMPLETE: frame=%d pass='depth' mode=d3d9_precise", g_nFrame );
+
+					ok = CapturePreciseDepthPass( view, "depth" );
+					LogMessage( "PASS END: frame=%d pass='depth' mode=d3d9_precise success=%d", g_nFrame, ok ? 1 : 0 );
 				}
-				LogMessage( "PASS RENDER COMPLETE: frame=%d pass='depth'", g_nFrame );
-				ok = CaptureTga( view, "depth" );
-				LogMessage( "PASS END: frame=%d pass='depth' success=%d", g_nFrame, ok ? 1 : 0 );
+				else
+				{
+					LogMessage( "PASS BEGIN: frame=%d pass='depth' mode=fog clear_flags=0x%X hud=%d fog_start=%g fog_end=%g",
+						g_nFrame, clearFlags, ( hudMask & ART_RECORD_DEPTH ) ? 1 : 0,
+						art_depth_start.GetFloat(), art_depth_end.GetFloat() );
+					CConVarRestore vars;
+					ApplyDepth( vars );
+					ApplyHudSetting( vars, hudMask, ART_RECORD_DEPTH );
+					g_pMaterials->ClearColor4ub( 255, 255, 255, 255 );
+					{
+						ArtScopedStageTiming renderTiming( ART_TIMING_RENDER );
+						g_pClient->RenderViewEx( utilityView, clearFlags,
+							AddHudDrawFlag( 0, hudMask, ART_RECORD_DEPTH ) );
+					}
+					LogMessage( "PASS RENDER COMPLETE: frame=%d pass='depth'", g_nFrame );
+					ok = CaptureTga( view, "depth" );
+					LogMessage( "PASS END: frame=%d pass='depth' mode=fog success=%d", g_nFrame, ok ? 1 : 0 );
+				}
 			}
 			else if ( ok )
 			{
